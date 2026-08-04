@@ -145,7 +145,7 @@ VIDEO_VISUAL_SCENE_RESCUE_MAX_POINTS = 12
 VIDEO_VISUAL_FRAME_VERIFICATION_ENABLED = True
 VIDEO_VISUAL_FRAME_VERIFICATION_BATCH_SIZE = 8
 VIDEO_VISUAL_FRAME_VERIFICATION_MIN_CONFIDENCE = 0.76
-VIDEO_VISUAL_ALIGNMENT_DRIVE_SYNC_EVERY = 1
+VIDEO_VISUAL_ALIGNMENT_DRIVE_SYNC_EVERY = 3
 # Política de cobertura: una pantalla estática puede demostrar varias acciones
 # consecutivas. Cuando Gemini comprobó semánticamente cada acción, una imagen
 # idéntica no se elimina solo por repetirse; primero se valida que corresponda al
@@ -159,6 +159,16 @@ VIDEO_VISUAL_MANIFEST_SYNC_EVERY = 4
 VIDEO_VISUAL_PREVIEW_LIMIT = 8
 VIDEO_VISUAL_KEEP_BYTES_IN_SESSION = False
 VIDEO_VISUAL_CACHE_DIRECT_UPLOAD = True
+# Caché persistente del video de Drive dentro del checkpoint local. Evita volver
+# a descargar cientos de MB en cada rerun mientras la instancia siga activa.
+DRIVE_VIDEO_CACHE_ENABLED = True
+DRIVE_VIDEO_CACHE_METADATA_FILENAME = "drive_source_cache.json"
+DRIVE_VIDEO_CACHE_BASENAME = "drive_source_video"
+DRIVE_VIDEO_CACHE_MAX_FILES = 2
+# Reutiliza temporalmente el archivo ya procesado por Gemini durante la auditoría
+# visual. Si Gemini ya no lo conserva o no está ACTIVE, se vuelve a subir.
+GEMINI_VISUAL_FILE_CACHE_ENABLED = True
+GEMINI_VISUAL_FILE_CACHE_FILENAME = "gemini_visual_file.json"
 VIDEO_POLL_INTERVAL_SECONDS = 5
 DRIVE_DOWNLOAD_TIMEOUT_SECONDS = 3600
 DRIVE_DOWNLOAD_CHUNK_MB = 8
@@ -4609,6 +4619,264 @@ def _cache_direct_upload_video(
         temporary.replace(target)
     return target
 
+
+def _drive_video_cache_metadata_path(checkpoint_id: str) -> Path:
+    return _checkpoint_root_dir(checkpoint_id) / DRIVE_VIDEO_CACHE_METADATA_FILENAME
+
+
+def _drive_video_cache_path(checkpoint_id: str, extension: str) -> Path:
+    suffix = re.sub(r"[^A-Za-z0-9]+", "", str(extension or "").lower()) or "mp4"
+    return _checkpoint_root_dir(checkpoint_id) / f"{DRIVE_VIDEO_CACHE_BASENAME}.{suffix}"
+
+
+def _drive_cache_identity_from_source(source_record: dict) -> dict:
+    return {
+        "file_id": _clean_action_value(source_record.get("drive_file_id")),
+        "modified_time": _clean_action_value(source_record.get("drive_modified_time")),
+        "size_bytes": int(source_record.get("size_bytes") or 0),
+        "extension": _clean_action_value(source_record.get("extension")) or "mp4",
+    }
+
+
+def _drive_cache_identity_from_metadata(metadata: dict) -> dict:
+    return {
+        "file_id": _clean_action_value(metadata.get("file_id") or metadata.get("id")),
+        "modified_time": _clean_action_value(
+            metadata.get("modifiedTime") or metadata.get("modified_time")
+        ),
+        "size_bytes": int(metadata.get("size_bytes") or metadata.get("size") or 0),
+        "extension": _clean_action_value(metadata.get("extension")) or "mp4",
+    }
+
+
+def _cached_drive_video_is_valid(
+    path: Path,
+    checkpoint_id: str,
+    expected: dict,
+) -> bool:
+    if not DRIVE_VIDEO_CACHE_ENABLED or not path.exists() or not path.is_file():
+        return False
+    try:
+        actual_size = path.stat().st_size
+        expected_size = int(expected.get("size_bytes") or 0)
+        if actual_size <= 0 or (expected_size > 0 and actual_size != expected_size):
+            return False
+
+        metadata_path = _drive_video_cache_metadata_path(checkpoint_id)
+        if not metadata_path.exists():
+            # Compatibilidad con un caché creado por una versión previa: el tamaño
+            # exacto y el nombre técnico siguen siendo una comprobación segura.
+            return expected_size > 0 and actual_size == expected_size
+
+        cached = json.loads(metadata_path.read_text(encoding="utf-8"))
+        cached_file_id = _clean_action_value(cached.get("file_id"))
+        expected_file_id = _clean_action_value(expected.get("file_id"))
+        if expected_file_id and cached_file_id and cached_file_id != expected_file_id:
+            return False
+
+        cached_modified = _clean_action_value(cached.get("modified_time"))
+        expected_modified = _clean_action_value(expected.get("modified_time"))
+        if expected_modified and cached_modified and cached_modified != expected_modified:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _prune_old_drive_video_caches(current_checkpoint_id: str) -> None:
+    """Limita únicamente las copias locales de videos; no borra transcripciones."""
+
+    if DRIVE_VIDEO_CACHE_MAX_FILES <= 0:
+        return
+    try:
+        configured = read_secret(
+            "VIDEO_CHECKPOINT_LOCAL_DIR",
+            VIDEO_CHECKPOINT_LOCAL_DIR,
+        ).strip()
+        root = Path(configured or VIDEO_CHECKPOINT_LOCAL_DIR)
+        candidates: list[tuple[float, Path, Path]] = []
+        if not root.exists():
+            return
+        current_root = _checkpoint_root_dir(current_checkpoint_id).resolve()
+        for metadata_path in root.glob(f"*/{DRIVE_VIDEO_CACHE_METADATA_FILENAME}"):
+            try:
+                cache_root = metadata_path.parent.resolve()
+                if cache_root == current_root:
+                    continue
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                raw_path = _clean_action_value(payload.get("local_path"))
+                video_path = Path(raw_path) if raw_path else next(
+                    metadata_path.parent.glob(f"{DRIVE_VIDEO_CACHE_BASENAME}.*"),
+                    None,
+                )
+                if video_path is None or not video_path.exists():
+                    continue
+                candidates.append((video_path.stat().st_mtime, video_path, metadata_path))
+            except Exception:
+                continue
+
+        # El caché actual cuenta dentro del límite; conserva los más recientes.
+        keep_others = max(0, DRIVE_VIDEO_CACHE_MAX_FILES - 1)
+        for _, video_path, metadata_path in sorted(candidates, reverse=True)[keep_others:]:
+            try:
+                video_path.unlink(missing_ok=True)
+                metadata_path.unlink(missing_ok=True)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _cache_drive_video_file(
+    local_path: Path,
+    checkpoint_id: str,
+    metadata: dict,
+) -> Path:
+    """Materializa una copia reutilizable sin duplicar el archivo cuando es posible."""
+
+    if not DRIVE_VIDEO_CACHE_ENABLED:
+        return local_path
+    identity = _drive_cache_identity_from_metadata(metadata)
+    target = _drive_video_cache_path(checkpoint_id, identity["extension"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if not _cached_drive_video_is_valid(target, checkpoint_id, identity):
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.unlink(missing_ok=True)
+        try:
+            os.link(local_path, temporary)
+        except Exception:
+            # No se usa enlace simbólico: el origen puede estar dentro de un
+            # TemporaryDirectory y desaparecer al finalizar la transcripción.
+            shutil.copyfile(local_path, temporary)
+        temporary.replace(target)
+
+    payload = {
+        **identity,
+        "version": "drive-video-cache-v1",
+        "local_path": str(target),
+        "saved_at_epoch": time.time(),
+    }
+    _write_json_atomic(_drive_video_cache_metadata_path(checkpoint_id), payload)
+    _prune_old_drive_video_caches(checkpoint_id)
+    return target
+
+
+def _recover_cached_drive_video(
+    source_record: dict,
+    checkpoint_id: str,
+) -> Path | None:
+    """Recupera el video local de Drive y valida identidad/tamaño antes de usarlo."""
+
+    if not DRIVE_VIDEO_CACHE_ENABLED:
+        return None
+    expected = _drive_cache_identity_from_source(source_record)
+    candidates: list[Path] = []
+    explicit = _clean_action_value(source_record.get("video_cached_path"))
+    if explicit:
+        candidates.append(Path(explicit))
+    candidates.append(_drive_video_cache_path(checkpoint_id, expected["extension"]))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _cached_drive_video_is_valid(candidate, checkpoint_id, expected):
+            source_record["video_cached_path"] = str(candidate)
+            return candidate
+    return None
+
+
+def _download_and_cache_drive_video(
+    source_record: dict,
+    checkpoint_id: str,
+    progress_callback=None,
+) -> Path:
+    reference = _clean_action_value(
+        source_record.get("drive_url") or source_record.get("drive_file_id")
+    )
+    if not reference:
+        raise AppError("No se encontró el enlace o ID del video de Google Drive.")
+
+    cache_dir = _checkpoint_root_dir(checkpoint_id) / "drive_download"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    metadata, downloaded = download_drive_video_to_path(
+        drive_reference=reference,
+        destination_dir=cache_dir,
+        progress_callback=progress_callback,
+    )
+    cached = _cache_drive_video_file(downloaded, checkpoint_id, metadata)
+    source_record.update(
+        {
+            "drive_file_id": metadata.get("file_id") or source_record.get("drive_file_id"),
+            "drive_modified_time": metadata.get("modifiedTime") or "",
+            "size_bytes": int(metadata.get("size_bytes") or source_record.get("size_bytes") or 0),
+            "extension": metadata.get("extension") or source_record.get("extension") or "mp4",
+            "video_cached_path": str(cached),
+        }
+    )
+    try:
+        if downloaded.exists() and downloaded.resolve() != cached.resolve():
+            downloaded.unlink(missing_ok=True)
+        if cache_dir.exists() and not any(cache_dir.iterdir()):
+            cache_dir.rmdir()
+    except Exception:
+        pass
+    return cached
+
+
+def _gemini_visual_file_cache_path(checkpoint_id: str) -> Path:
+    # Se guarda dentro de visuals para incluirlo en visuals_bundle.zip y poder
+    # recuperarlo desde Drive junto con el resto del checkpoint visual.
+    return _video_visual_dir(checkpoint_id) / GEMINI_VISUAL_FILE_CACHE_FILENAME
+
+
+def _reuse_gemini_visual_file(client, checkpoint_id: str, local_path: Path):
+    if not GEMINI_VISUAL_FILE_CACHE_ENABLED:
+        return None
+    cache_path = _gemini_visual_file_cache_path(checkpoint_id)
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if int(payload.get("source_size") or 0) != local_path.stat().st_size:
+            return None
+        name = _clean_action_value(payload.get("name"))
+        if not name:
+            return None
+        file_info = client.files.get(name=name)
+        if "ACTIVE" not in _file_state_name(file_info):
+            return None
+        return file_info
+    except Exception:
+        return None
+
+
+def _save_gemini_visual_file_cache(
+    checkpoint_id: str,
+    local_path: Path,
+    file_info,
+) -> None:
+    if not GEMINI_VISUAL_FILE_CACHE_ENABLED:
+        return
+    try:
+        _write_json_atomic(
+            _gemini_visual_file_cache_path(checkpoint_id),
+            {
+                "version": "gemini-visual-file-cache-v1",
+                "source_size": local_path.stat().st_size,
+                "name": str(getattr(file_info, "name", "") or ""),
+                "uri": str(getattr(file_info, "uri", "") or ""),
+                "mime_type": str(getattr(file_info, "mime_type", "") or ""),
+                "saved_at_epoch": time.time(),
+            },
+        )
+    except Exception:
+        pass
+
+
 def _write_visual_bundle_to_drive(checkpoint_id: str, visual_dir: Path) -> bool:
     if not _drive_checkpoint_folder_id() or not visual_dir.exists():
         return False
@@ -5707,12 +5975,25 @@ def _rescue_visual_alignment_from_candidate_frames(
         candidate["trusted"] = _visual_alignment_item_is_trusted(candidate)
         return candidate
 
-def _upload_video_for_visual_alignment(client, local_path: Path, progress_callback=None):
-    """Sube una sola vez el video durante la fase de alineación semántica."""
+def _upload_video_for_visual_alignment(
+    client,
+    local_path: Path,
+    checkpoint_id: str,
+    progress_callback=None,
+):
+    """Reutiliza el archivo de Gemini y solo lo sube cuando ya no está disponible."""
+
+    reused = _reuse_gemini_visual_file(client, checkpoint_id, local_path)
+    if reused is not None:
+        if progress_callback is not None:
+            progress_callback(
+                "Reutilizando el video ya preparado por Gemini para la auditoría visual."
+            )
+        return reused
 
     if progress_callback is not None:
         progress_callback(
-            "Subiendo temporalmente el video para comprobar cada paso contra la pantalla."
+            "Subiendo una sola vez el video para comprobar los pasos contra la pantalla."
         )
     uploaded_file = _upload_gemini_file_with_retries(
         client=client,
@@ -5731,6 +6012,7 @@ def _upload_video_for_visual_alignment(client, local_path: Path, progress_callba
         file_info = client.files.get(name=uploaded_file.name)
         state_name = _file_state_name(file_info)
         if "ACTIVE" in state_name:
+            _save_gemini_visual_file_cache(checkpoint_id, local_path, file_info)
             return file_info
         if "FAILED" in state_name:
             raise AppError(
@@ -5845,6 +6127,7 @@ def _prepare_semantic_visual_alignment(
         uploaded_file = _upload_video_for_visual_alignment(
             client,
             local_path,
+            checkpoint_id=checkpoint_id,
             progress_callback=progress_callback,
         )
 
@@ -6015,11 +6298,9 @@ def _prepare_semantic_visual_alignment(
         return stored
 
     finally:
-        if uploaded_file is not None and getattr(uploaded_file, "name", None):
-            try:
-                client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
+        # El archivo remoto se conserva para poder reanudar sin volver a subir el
+        # video. En una ejecución futura se valida con client.files.get; si ya no
+        # existe o no está ACTIVE, el bot lo vuelve a subir automáticamente.
         try:
             client.close()
         except Exception:
@@ -7062,6 +7343,7 @@ def _prepare_video_visual_evidence(
             f"{len(extracted_by_index)} de {len(actions)} ya estaban guardadas."
         )
 
+    newly_extracted_indices: set[int] = set()
     all_hashes: list[str] = []
     all_seconds: list[float] = []
     for index in sorted(extracted_by_index):
@@ -7187,6 +7469,7 @@ def _prepare_video_visual_evidence(
             )
         if item:
             extracted_by_index[action_index] = item
+            newly_extracted_indices.add(action_index)
             all_hashes.append(str(item.get("image_hash") or ""))
             all_seconds.append(float(item.get("timestamp_seconds") or 0.0))
             processed_since_sync += 1
@@ -7250,6 +7533,7 @@ def _prepare_video_visual_evidence(
                 break
         if recovered_item is not None:
             extracted_by_index[missing_index] = recovered_item
+            newly_extracted_indices.add(missing_index)
             current = [
                 extracted_by_index[index]
                 for index in sorted(extracted_by_index)
@@ -7263,11 +7547,18 @@ def _prepare_video_visual_evidence(
 
     # Verificación final de la imagen exacta. Una alineación correcta sobre el
     # video no basta: se comprueba el PNG que realmente recibirá Word.
+    indices_to_verify = sorted(
+        index
+        for index in newly_extracted_indices
+        if index in extracted_by_index
+        and not bool(extracted_by_index[index].get("frame_verified"))
+    )
     frame_failures = _verify_extracted_visuals(
         actions=actions,
         extracted_by_index=extracted_by_index,
         progress_callback=progress_callback,
-    )
+        only_indices=indices_to_verify,
+    ) if indices_to_verify else {}
 
     if frame_failures:
         api_key = read_secret("GEMINI_API_KEY", "").strip()
@@ -7322,6 +7613,7 @@ def _prepare_video_visual_evidence(
                 )
                 if repaired_item is not None:
                     extracted_by_index[failed_index] = repaired_item
+                    newly_extracted_indices.add(failed_index)
                     rescued_indices.append(failed_index)
 
             _write_visual_alignment(
@@ -7492,6 +7784,7 @@ def _prepare_video_visual_evidence(
                         break
                 if not still_duplicate:
                     extracted_by_index[duplicate_index] = repaired
+                    newly_extracted_indices.add(duplicate_index)
                     continue
 
             rejected = extracted_by_index.pop(duplicate_index, None)
@@ -7533,6 +7826,7 @@ def _prepare_video_visual_evidence(
         )
         if item is not None:
             extracted_by_index[missing_index] = item
+            newly_extracted_indices.add(missing_index)
 
     # Las reparaciones de duplicados y el rescate final también deben pasar por
     # la verificación del PNG exacto antes de considerarse válidas.
@@ -8839,6 +9133,11 @@ def transcribe_drive_video_with_gemini(
             st.session_state.get("video_checkpoint_id")
             or hashlib.sha256(("visual-" + drive_checkpoint_key).encode("utf-8")).hexdigest()
         )
+        cached_video_path = _cache_drive_video_file(
+            local_path=local_path,
+            checkpoint_id=checkpoint_id,
+            metadata=metadata,
+        )
         existing_visuals = _load_local_video_visuals(
             checkpoint_id,
             list(transcript.actions),
@@ -8855,13 +9154,15 @@ def transcribe_drive_video_with_gemini(
         "text": "",
         "page_count": None,
         "warnings": [
-            "El video se descargó por bloques desde Google Drive y no se guardó "
-            "en la memoria de la sesión."
+            "El video se descargó por bloques desde Google Drive y quedó en "
+            "caché local del checkpoint para evitar descargas repetidas."
         ],
         "is_video": True,
         "origin_kind": "google_drive",
         "drive_file_id": metadata["file_id"],
+        "drive_modified_time": metadata.get("modifiedTime") or "",
         "drive_url": metadata.get("webViewLink") or drive_reference,
+        "video_cached_path": str(cached_video_path),
         "video_actions": [action.model_dump() for action in transcript.actions],
         "video_action_count": len(transcript.actions),
         "video_checkpoint_id": checkpoint_id,
@@ -10436,18 +10737,28 @@ def _ensure_visuals_from_original_video(
     )
 
     if origin_kind == "google_drive" and reference:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            _, local_path = download_drive_video_to_path(
-                drive_reference=reference,
-                destination_dir=Path(temp_dir),
-                progress_callback=progress_callback,
-            )
-            _prepare_video_visual_evidence(
-                local_path=local_path,
-                actions=actions,
+        local_path = _recover_cached_drive_video(source_record, checkpoint_id)
+        if local_path is not None:
+            if progress_callback is not None:
+                progress_callback(
+                    "Video recuperado del caché local del checkpoint; se omite la descarga desde Drive."
+                )
+        else:
+            if progress_callback is not None:
+                progress_callback(
+                    "El video no está en el caché local o cambió en Drive; se descargará una sola vez."
+                )
+            local_path = _download_and_cache_drive_video(
+                source_record=source_record,
                 checkpoint_id=checkpoint_id,
                 progress_callback=progress_callback,
             )
+        _prepare_video_visual_evidence(
+            local_path=local_path,
+            actions=actions,
+            checkpoint_id=checkpoint_id,
+            progress_callback=progress_callback,
+        )
     else:
         cached_path = _clean_action_value(source_record.get("video_cached_path"))
         cached = Path(cached_path) if cached_path else None
@@ -11727,7 +12038,14 @@ def show_video_transcript_review(source_record: dict) -> str | None:
                 st.warning(uncertainty)
 
     action_total = len(review_actions) if transcript else 0
-    visual_total = int(source_record.get("video_visual_count") or 0)
+    recovered_for_counter = _recover_source_record_visuals(source_record) if action_total else []
+    ready_for_counter, pending_for_counter, _ = _visual_coverage_for_actions(
+        recovered_for_counter,
+        review_actions,
+    ) if action_total else ([], [], 0)
+    visual_total = len(ready_for_counter)
+    source_record["video_visual_count"] = visual_total
+    source_record["video_visual_pending"] = len(pending_for_counter)
     if transcript and action_total and visual_total < action_total:
         st.info(
             "La transcripción ya quedó guardada. La evidencia visual se procesa "
