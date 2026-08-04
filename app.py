@@ -10071,10 +10071,226 @@ def _procedure_render_plan(
     return _build_visual_procedure_groups(aligned_actions)
 
 
+
+def _visual_record_is_word_ready(item: dict | None) -> bool:
+    """Valida que una captura pueda insertarse de forma segura en Word/PDF."""
+
+    if not isinstance(item, dict):
+        return False
+    if VIDEO_VISUAL_ALIGNMENT_ENABLED:
+        if not bool(item.get("semantic_valid")):
+            return False
+        if not bool(item.get("frame_verified")):
+            return False
+    if item.get("fingerprint_matches") is False:
+        return False
+    return bool(_visual_bytes(item))
+
+
+def _visual_coverage_for_actions(
+    recovered: list[dict],
+    actions: list[VideoAction],
+) -> tuple[list[dict], list[int], int]:
+    """Relaciona capturas verificadas con el inventario actual de acciones.
+
+    Una cantidad física igual al número de acciones no significa cobertura:
+    puede tratarse de imágenes sin verificar, de otro inventario o con IDs
+    desplazados. Esta función exige una relación uno a uno por action_id/índice.
+    """
+
+    expected_by_id = {
+        _clean_action_value(action.action_id): index
+        for index, action in enumerate(actions)
+        if _clean_action_value(action.action_id)
+    }
+    ready_by_index: dict[int, dict] = {}
+    rejected = 0
+
+    for item in recovered:
+        if not _visual_record_is_word_ready(item):
+            rejected += 1
+            continue
+
+        action_id = _clean_action_value(item.get("action_id"))
+        raw_index = item.get("action_index")
+        try:
+            stored_index = int(raw_index)
+        except (TypeError, ValueError):
+            stored_index = -1
+
+        mapped_index: int | None = None
+        if action_id and action_id in expected_by_id:
+            mapped_index = expected_by_id[action_id]
+            # Un ID correcto con un índice diferente indica un checkpoint
+            # desfasado. No debe reutilizarse silenciosamente.
+            if stored_index >= 0 and stored_index != mapped_index:
+                rejected += 1
+                continue
+        elif 0 <= stored_index < len(actions):
+            expected_id = _clean_action_value(actions[stored_index].action_id)
+            if action_id and expected_id and action_id != expected_id:
+                rejected += 1
+                continue
+            mapped_index = stored_index
+
+        if mapped_index is None:
+            rejected += 1
+            continue
+
+        previous = ready_by_index.get(mapped_index)
+        current_confidence = float(
+            item.get("frame_verification_confidence")
+            or item.get("semantic_confidence")
+            or 0.0
+        )
+        previous_confidence = float(
+            (previous or {}).get("frame_verification_confidence")
+            or (previous or {}).get("semantic_confidence")
+            or 0.0
+        )
+        if previous is None or current_confidence >= previous_confidence:
+            prepared = dict(item)
+            prepared["action_index"] = mapped_index
+            prepared["action_id"] = actions[mapped_index].action_id
+            ready_by_index[mapped_index] = prepared
+
+    ready = [ready_by_index[index] for index in sorted(ready_by_index)]
+    pending = [index for index in range(len(actions)) if index not in ready_by_index]
+    return ready, pending, rejected
+
+
+def _visual_map_ready_count(visual_map: dict[str, object]) -> int:
+    value = visual_map.get("__ready_count__")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        ordered = visual_map.get("__all__")
+        return len(ordered) if isinstance(ordered, list) else 0
+
+
+def _visual_map_recovered_count(visual_map: dict[str, object]) -> int:
+    value = visual_map.get("__recovered_count__")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return _visual_map_ready_count(visual_map)
+
+
+def _visual_procedure_section_score(
+    section: FinalSection,
+    action_count: int,
+) -> int:
+    title = _normalized_action_key(section.title)
+    basis = _normalized_action_key(" ".join(section.source_basis))
+    score = 0
+
+    if "paso a paso" in title:
+        score += 120
+    elif "procedimiento" in title:
+        score += 110
+    elif "actividades" in title:
+        score += 90
+    elif "desarrollo" in title:
+        score += 75
+    elif "metodologia" in title:
+        score += 65
+    elif any(term in title for term in PROCEDURAL_TITLE_TERMS):
+        score += 50
+
+    if "inventario audiovisual" in basis or "acciones verificables" in basis:
+        score += 45
+    if action_count and len(section.numbered_items) == action_count:
+        score += 35
+    elif section.numbered_items:
+        score += 10
+    return score
+
+
+def _select_visual_procedure_section_order(
+    final_document: FinalDocument,
+    actions: list[VideoAction],
+) -> int | None:
+    if not final_document.sections or not actions:
+        return None
+    ranked = sorted(
+        (
+            (_visual_procedure_section_score(section, len(actions)), section.order)
+            for section in final_document.sections
+        ),
+        reverse=True,
+    )
+    if not ranked or ranked[0][0] <= 0:
+        return None
+    return int(ranked[0][1])
+
+
+def _ensure_video_procedure_steps_for_export(
+    final_document: FinalDocument,
+    actions: list[VideoAction],
+) -> tuple[FinalDocument, int | None]:
+    """Garantiza que la exportación tenga un paso por acción audiovisual.
+
+    No agrega una sección nueva ni altera títulos institucionales. Usa la
+    sección procedimental existente con mayor correspondencia. Si el editor o
+    una respuesta de Gemini dejó esa sección vacía o con un conteo distinto,
+    la reconstruye determinísticamente desde ACC-XXXX.
+    """
+
+    target_order = _select_visual_procedure_section_order(final_document, actions)
+    if target_order is None:
+        return final_document, None
+
+    rebuilt: list[FinalSection] = []
+    changed = False
+    for section in final_document.sections:
+        if section.order != target_order:
+            rebuilt.append(section)
+            continue
+
+        if len(section.numbered_items) == len(actions) and all(
+            str(item).strip() for item in section.numbered_items
+        ):
+            rebuilt.append(section)
+            continue
+
+        changed = True
+        rebuilt.append(
+            section.model_copy(
+                update={
+                    "numbered_items": [
+                        _action_to_detailed_step(action) for action in actions
+                    ],
+                    "source_basis": [
+                        f"Inventario audiovisual {actions[0].action_id}–"
+                        f"{actions[-1].action_id}; {len(actions)} acciones verificables."
+                    ],
+                }
+            )
+        )
+
+    if not changed:
+        return final_document, target_order
+
+    warnings = list(final_document.warnings)
+    warnings.append(
+        "La sección procedimental se reconstruyó para exportación con una "
+        "actividad independiente por cada acción audiovisual."
+    )
+    return (
+        final_document.model_copy(
+            update={
+                "sections": rebuilt,
+                "warnings": list(dict.fromkeys(warnings)),
+            }
+        ),
+        target_order,
+    )
+
+
 def _recover_source_record_visuals(
     source_record: dict | None,
 ) -> list[dict]:
-    """Recupera metadatos visuales sin guardar los PNG dentro de la sesión."""
+    """Recupera metadatos visuales y separa archivos físicos de capturas listas."""
 
     if not source_record:
         return []
@@ -10091,8 +10307,18 @@ def _recover_source_record_visuals(
     if not recovered and _restore_visual_bundle_from_drive(checkpoint_id):
         recovered = _load_local_video_visuals(checkpoint_id, actions)
 
-    source_record["video_visual_count"] = len(recovered)
-    source_record["video_visual_pending"] = max(0, len(actions) - len(recovered))
+    ready, pending_indices, rejected = _visual_coverage_for_actions(
+        recovered,
+        actions,
+    )
+    source_record["video_visual_recovered_count"] = len(recovered)
+    source_record["video_visual_count"] = len(ready)
+    source_record["video_visual_ready_count"] = len(ready)
+    source_record["video_visual_unverified_count"] = rejected
+    source_record["video_visual_pending"] = len(pending_indices)
+    source_record["video_visual_pending_ids"] = [
+        actions[index].action_id for index in pending_indices[:40]
+    ]
     # Solo se conservan metadatos ligeros en session_state.
     source_record["video_visuals"] = [
         {
@@ -10100,34 +10326,28 @@ def _recover_source_record_visuals(
             for key, value in item.items()
             if key not in {"content", "content_path", "local_path"}
         }
-        for item in recovered
+        for item in ready
     ]
     return recovered
 
 def _visuals_by_action_id(source_record: dict | None) -> dict[str, object]:
-    """Indexa capturas por ID, índice y lista cronológica completa."""
+    """Indexa únicamente capturas verificadas y compatibles con el inventario."""
 
     result: dict[str, object] = {}
-    ordered: list[dict] = []
-    for item in _recover_source_record_visuals(source_record):
+    actions = _source_video_actions(source_record or {})
+    recovered = _recover_source_record_visuals(source_record)
+    ready, _, _ = _visual_coverage_for_actions(recovered, actions)
+
+    for item in ready:
         action_id = _clean_action_value(item.get("action_id"))
-        if VIDEO_VISUAL_ALIGNMENT_ENABLED and (
-            not bool(item.get("semantic_valid"))
-            or not bool(item.get("frame_verified"))
-        ):
-            continue
-        if not _visual_bytes(item):
-            continue
-        ordered.append(item)
+        action_index = int(item.get("action_index") or 0)
         if action_id:
             result[action_id] = item
-        try:
-            action_index = int(item.get("action_index"))
-            result[f"__index__:{action_index}"] = item
-        except (TypeError, ValueError):
-            pass
-    ordered.sort(key=lambda item: int(item.get("action_index") or 0))
-    result["__all__"] = ordered
+        result[f"__index__:{action_index}"] = item
+
+    result["__all__"] = ready
+    result["__ready_count__"] = len(ready)
+    result["__recovered_count__"] = len(recovered)
     return result
 
 
@@ -10165,12 +10385,13 @@ def _ensure_visuals_from_original_video(
     source_record: dict,
     progress_callback=None,
 ) -> list[dict]:
-    """Recupera o completa las capturas sin repetir la transcripción.
+    """Recupera o completa capturas verificadas sin confundir archivos parciales.
 
-    Un checkpoint parcial no se considera terminado. La versión anterior
-    devolvía inmediatamente cualquier lista no vacía; por eso, si existían
-    304 de 338 capturas, el botón de reanudación y la generación usaban solo
-    esas 304 y nunca procesaban las 34 pendientes.
+    Una imagen física no se considera lista hasta que:
+    - pertenezca al inventario actual;
+    - tenga relación exacta con action_id/índice;
+    - apruebe la auditoría semántica;
+    - apruebe la verificación del PNG que se insertará.
     """
 
     actions = _source_video_actions(source_record)
@@ -10182,15 +10403,31 @@ def _ensure_visuals_from_original_video(
         return []
 
     recovered = _recover_source_record_visuals(source_record)
-    if len(recovered) == len(actions):
-        return recovered
+    ready, pending_indices, rejected = _visual_coverage_for_actions(
+        recovered,
+        actions,
+    )
+    if not pending_indices:
+        return ready
 
-    if progress_callback is not None and recovered:
-        progress_callback(
-            "Checkpoint visual parcial recuperado: "
-            f"{len(recovered)} de {len(actions)} capturas. "
-            "Se procesarán únicamente las pendientes."
-        )
+    if progress_callback is not None:
+        if recovered:
+            progress_callback(
+                "Checkpoint visual recuperado: "
+                f"{len(recovered)} archivos físicos, {len(ready)} capturas "
+                f"verificadas y {len(pending_indices)} pendientes. "
+                "Se revalidarán o regenerarán únicamente las pendientes."
+            )
+        else:
+            progress_callback(
+                f"No hay capturas verificadas todavía; se procesarán "
+                f"{len(actions)} acciones."
+            )
+        if rejected:
+            progress_callback(
+                f"{rejected} captura(s) recuperada(s) no se reutilizarán porque "
+                "están sin verificar, desfasadas o pertenecen a otro inventario."
+            )
 
     origin_kind = _clean_action_value(source_record.get("origin_kind")).casefold()
     reference = _clean_action_value(
@@ -10205,7 +10442,7 @@ def _ensure_visuals_from_original_video(
                 destination_dir=Path(temp_dir),
                 progress_callback=progress_callback,
             )
-            visuals = _prepare_video_visual_evidence(
+            _prepare_video_visual_evidence(
                 local_path=local_path,
                 actions=actions,
                 checkpoint_id=checkpoint_id,
@@ -10215,7 +10452,7 @@ def _ensure_visuals_from_original_video(
         cached_path = _clean_action_value(source_record.get("video_cached_path"))
         cached = Path(cached_path) if cached_path else None
         if cached is not None and cached.exists() and cached.is_file():
-            visuals = _prepare_video_visual_evidence(
+            _prepare_video_visual_evidence(
                 local_path=cached,
                 actions=actions,
                 checkpoint_id=checkpoint_id,
@@ -10225,28 +10462,48 @@ def _ensure_visuals_from_original_video(
             content = source_record.get("content")
             extension = _clean_action_value(source_record.get("extension")) or "mp4"
             if not isinstance(content, (bytes, bytearray)) or not content:
-                return []
+                raise AppError(
+                    "Hay capturas pendientes de verificación, pero el video original "
+                    "no está disponible para reanudarlas. Selecciona nuevamente el "
+                    "mismo video o conserva su enlace de Google Drive."
+                )
             with tempfile.TemporaryDirectory() as temp_dir:
                 local_path = Path(temp_dir) / f"video_origen.{extension}"
                 local_path.write_bytes(bytes(content))
-                visuals = _prepare_video_visual_evidence(
+                _prepare_video_visual_evidence(
                     local_path=local_path,
                     actions=actions,
                     checkpoint_id=checkpoint_id,
                     progress_callback=progress_callback,
                 )
 
+    recovered_after = _recover_source_record_visuals(source_record)
+    ready_after, pending_after, rejected_after = _visual_coverage_for_actions(
+        recovered_after,
+        actions,
+    )
     source_record["video_visuals"] = [
         {
             key: value
             for key, value in item.items()
             if key not in {"content", "content_path", "local_path"}
         }
-        for item in visuals
+        for item in ready_after
     ]
-    source_record["video_visual_count"] = len(visuals)
-    source_record["video_visual_pending"] = max(0, len(actions) - len(visuals))
-    return visuals
+    source_record["video_visual_recovered_count"] = len(recovered_after)
+    source_record["video_visual_count"] = len(ready_after)
+    source_record["video_visual_ready_count"] = len(ready_after)
+    source_record["video_visual_unverified_count"] = rejected_after
+    source_record["video_visual_pending"] = len(pending_after)
+
+    if pending_after:
+        detail = ", ".join(actions[index].action_id for index in pending_after[:14])
+        raise AppError(
+            "La cobertura visual todavía no está lista para exportar: "
+            f"{len(ready_after)} de {len(actions)} capturas están verificadas. "
+            f"Pendientes: {detail}. El checkpoint válido quedó guardado."
+        )
+    return ready_after
 
 def add_safe_subheading(document: Document, text: str):
     clean_text = _normalize_document_text(text)
@@ -10685,16 +10942,38 @@ def create_docx(
     """Crea el instructivo y fuerza la inserción verificable de capturas."""
 
     final_document = normalize_final_document_structure(final_document)
+    actions = _source_video_actions(source_record or {})
+    visual_required = bool(source_record and source_record.get("is_video") and actions)
+    visual_target_order: int | None = None
+    if visual_required:
+        final_document, visual_target_order = _ensure_video_procedure_steps_for_export(
+            final_document,
+            actions,
+        )
+        if visual_target_order is None:
+            raise AppError(
+                "El documento tiene origen de video, pero no se identificó la "
+                "sección PASO A PASO/PROCEDIMIENTO donde deben insertarse las capturas."
+            )
+
     document, inherited_layout = load_visual_guide_document(style_guide)
     configure_docx(document, preserve_guide_layout=inherited_layout)
     apply_dynamic_page_numbering(document)
 
-    actions = _source_video_actions(source_record or {})
     visuals = _visuals_by_action_id(source_record)
+    ready_visual_count = _visual_map_ready_count(visuals)
+    recovered_visual_count = _visual_map_recovered_count(visuals)
+    if visual_required and ready_visual_count != len(actions):
+        raise AppError(
+            "Las capturas físicas existen, pero todavía no están listas para Word. "
+            f"Recuperadas: {recovered_visual_count}; verificadas y relacionadas: "
+            f"{ready_visual_count} de {len(actions)}. Vuelve al paso de alineación "
+            "visual para revalidar únicamente las pendientes."
+        )
+
     inserted_visuals = 0
     expected_visual_steps = 0
     missing_visual_steps: list[str] = []
-    visual_required = bool(source_record and source_record.get("is_video") and actions)
 
     title = document.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -10726,7 +11005,11 @@ def create_docx(
                 paragraph = document.add_paragraph(paragraph_text.strip())
                 _format_body_paragraph(paragraph)
 
-        procedure_plan = _procedure_render_plan(section, source_record)
+        procedure_plan = (
+            _procedure_render_plan(section, source_record)
+            if section.order == visual_target_order
+            else []
+        )
         rendered_indices: set[int] = set()
 
         if procedure_plan:
@@ -10770,7 +11053,7 @@ def create_docx(
                 step_text,
                 f"{section.order}.{step_index + 1}",
             )
-            if _section_is_visual_procedure(section, source_record):
+            if section.order == visual_target_order:
                 expected_visual_steps += 1
                 if step_index < len(actions):
                     visual = _visual_for_action(visuals, actions[step_index], step_index)
@@ -10805,9 +11088,12 @@ def create_docx(
             )
         if inserted_visuals <= 0 or embedded_count <= 0:
             raise AppError(
-                "Se recuperaron capturas, pero ninguna quedó insertada en el Word. "
-                f"Capturas disponibles: {len(visuals)}; intentos de inserción: "
-                f"{inserted_visuals}; imágenes dentro del DOCX: {embedded_count}."
+                "Las capturas fueron verificadas, pero no se insertó evidencia en "
+                "la sección procedimental del Word. "
+                f"Capturas verificadas: {ready_visual_count}; pasos visuales "
+                f"detectados: {expected_visual_steps}; capturas insertadas: "
+                f"{inserted_visuals}; recursos gráficos totales dentro del DOCX: "
+                f"{embedded_count}."
             )
         if VIDEO_VISUAL_REQUIRE_EVERY_STEP and (
             missing_visual_steps or inserted_visuals < expected_visual_steps
@@ -10899,8 +11185,14 @@ def create_pdf(
     """Crea una versión PDF estructurada con numeración dinámica."""
 
     final_document = normalize_final_document_structure(final_document)
-    visuals = _visuals_by_action_id(source_record)
     actions = _source_video_actions(source_record or {})
+    visual_target_order: int | None = None
+    if source_record and source_record.get("is_video") and actions:
+        final_document, visual_target_order = _ensure_video_procedure_steps_for_export(
+            final_document,
+            actions,
+        )
+    visuals = _visuals_by_action_id(source_record)
     output = BytesIO()
     styles = getSampleStyleSheet()
 
@@ -11014,7 +11306,11 @@ def create_pdf(
                     pdf_paragraph(paragraph_text.strip(), body_style)
                 )
 
-        procedure_plan = _procedure_render_plan(section, source_record)
+        procedure_plan = (
+            _procedure_render_plan(section, source_record)
+            if section.order == visual_target_order
+            else []
+        )
         if procedure_plan:
             for group in procedure_plan:
                 group_index = int(group["group_index"])
@@ -11069,7 +11365,7 @@ def create_pdf(
                     visual_flowable = None
                     action_index = index - 1
                     if (
-                        _section_is_visual_procedure(section, source_record)
+                        section.order == visual_target_order
                         and action_index < len(actions)
                     ):
                         visual_flowable = _reportlab_visual(
